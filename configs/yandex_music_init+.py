@@ -6,15 +6,15 @@ import pyautogui
 import pytesseract
 from PIL import ImageOps, ImageEnhance
 
-# Отключаем защиту угла экрана pyautogui, чтобы спокойно уводить мышь в (5, 5)
 pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
 
-# Команда запуска Яндекс Музыки
 YM_LAUNCH_CMD = ["yandexmusic"]
 
-# Путь к картинке кнопки "Слушать"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LISTEN_BTN_IMAGE = os.path.join(SCRIPT_DIR, "listen_btn.png")
+CACHE_DIR = "/dev/shm/ym_playlist_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 def run_cmd(cmd):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -22,44 +22,49 @@ def run_cmd(cmd):
 
 def get_ym_window():
     """Ищет реальное видимое окно Яндекс Музыки."""
-    win_ids = run_cmd(["xdotool", "search", "--name", "Яндекс Музыка"]).split('\n')
+    win_ids = run_cmd(["xdotool", "search", "--onlyvisible", "--name", "Яндекс Музыка"]).split('\n')
     for wid in win_ids:
         if wid and "=" in run_cmd(["xprop", "-id", wid, "_NET_WM_DESKTOP"]):
             return wid
     return None
 
+def get_window_region(win_id):
+    """Быстро получает координаты и размер окна (X, Y, W, H)."""
+    out = run_cmd(["xdotool", "getwindowgeometry", "--shell", win_id])
+    geom = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            geom[k] = int(v)
+    if all(k in geom for k in ("X", "Y", "WIDTH", "HEIGHT")):
+        return (geom["X"], geom["Y"], geom["WIDTH"], geom["HEIGHT"])
+    return None
+
 def ensure_yandex_music_running():
-    """Активирует окно Яндекс Музыки или запускает программу, если она закрыта."""
+    """Активирует окно Яндекс Музыки и возвращает его ID."""
     win_id = get_ym_window()
     
     if not win_id:
         try:
             subprocess.Popen(YM_LAUNCH_CMD, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            return False
+            return None
 
         for _ in range(40):
-            time.sleep(0.25)
+            time.sleep(0.2)
             win_id = get_ym_window()
             if win_id:
-                time.sleep(2.5)
+                time.sleep(2.0)
                 break
 
     if not win_id:
-        return False
+        return None
 
     subprocess.run(["xdotool", "windowactivate", "--sync", win_id], stderr=subprocess.DEVNULL)
-    time.sleep(0.05)
-    return True
+    return win_id
 
 def ask_playlist_name():
-    """
-    Открывает окно ввода по центру экрана.
-    Возвращает:
-      - строку с названием (если ввели текст и нажали Enter),
-      - пустую строку "" (если стерли текст и нажали Enter — режим «просто запуск»),
-      - None (если нажали Esc, кнопку «Отмена» или закрыли окно).
-    """
+    """Открывает окно ввода по центру экрана."""
     result = {"name": None}
 
     root = tk.Tk()
@@ -119,14 +124,12 @@ def ask_playlist_name():
     entry.focus_force()
 
     def on_submit(event=None):
-        # Сохраняем строку (даже если она пустая "")
         result["name"] = entry.get().strip()
         root.withdraw()
         root.update()
         root.destroy()
 
     def on_cancel(event=None):
-        # При отмене оставляем None
         result["name"] = None
         root.withdraw()
         root.update()
@@ -176,31 +179,47 @@ def ask_playlist_name():
     root.mainloop()
     return result["name"]
 
-def preprocess_for_ocr(pil_img, scale=2):
-    """Увеличивает скриншот и повышает контраст, чтобы Tesseract не пропускал слова."""
-    w, h = pil_img.size
-    enlarged = pil_img.resize((w * scale, h * scale))
-    gray = ImageOps.grayscale(enlarged)
-    contrasted = ImageEnhance.Contrast(gray).enhance(2.0)
-    return contrasted
+def detect_ocr_lang(text):
+    has_cyr = any('а' <= ch <= 'я' or ch == 'ё' for ch in text.lower())
+    has_lat = any('a' <= ch <= 'z' for ch in text.lower())
+    if has_cyr and not has_lat:
+        return 'rus'
+    if has_lat and not has_cyr:
+        return 'eng'
+    return 'rus+eng'
 
-def find_and_click_text(target_text, retries=4, double_click=False):
-    """Ищет название плейлиста с предобработкой изображения и несколькими попытками."""
+def find_and_click_text(target_text, region=None, retries=3, double_click=False):
     target_lower = target_text.lower()
+    safe_name = "".join(c if c.isalnum() else "_" for c in target_lower)
+    cache_img_path = os.path.join(CACHE_DIR, f"pl_{safe_name}.png")
+
+    if os.path.exists(cache_img_path):
+        try:
+            loc = pyautogui.locateCenterOnScreen(cache_img_path, region=region, confidence=0.88)
+            if loc:
+                if double_click:
+                    pyautogui.doubleClick(loc.x, loc.y)
+                else:
+                    pyautogui.click(loc.x, loc.y)
+                return True
+        except Exception:
+            pass
+
     target_words = target_lower.split()
-    scale = 2
+    lang = detect_ocr_lang(target_lower)
+    offset_x = region[0] if region else 0
+    offset_y = region[1] if region else 0
 
-    for attempt in range(retries):
-        time.sleep(0.05)
-
-        screenshot = pyautogui.screenshot()
-        processed_img = preprocess_for_ocr(screenshot, scale=scale)
+    for _ in range(retries):
+        screenshot = pyautogui.screenshot(region=region)
+        gray = ImageOps.grayscale(screenshot)
+        processed_img = ImageEnhance.Contrast(gray).enhance(2.0)
 
         data = pytesseract.image_to_data(
             processed_img,
             output_type=pytesseract.Output.DICT,
-            lang='rus+eng',
-            config='--psm 11'
+            lang=lang,
+            config='--psm 11 --oem 1'
         )
 
         n_boxes = len(data['text'])
@@ -218,13 +237,25 @@ def find_and_click_text(target_text, retries=4, double_click=False):
                     matched = True
 
             if matched:
-                x = data['left'][i] // scale
-                y = data['top'][i] // scale
-                w = data['width'][i] // scale
-                h = data['height'][i] // scale
+                x = data['left'][i]
+                y = data['top'][i]
+                w = data['width'][i]
+                h = data['height'][i]
 
-                click_x = x + (w // 2)
-                click_y = y + (h // 2)
+                try:
+                    pad = 4
+                    crop_box = (
+                        max(0, x - pad),
+                        max(0, y - pad),
+                        min(screenshot.width, x + w + pad),
+                        min(screenshot.height, y + h + pad)
+                    )
+                    screenshot.crop(crop_box).save(cache_img_path)
+                except Exception:
+                    pass
+
+                click_x = offset_x + x + (w // 2)
+                click_y = offset_y + y + (h // 2)
 
                 if double_click:
                     pyautogui.doubleClick(click_x, click_y)
@@ -232,55 +263,123 @@ def find_and_click_text(target_text, retries=4, double_click=False):
                     pyautogui.click(click_x, click_y)
                 return True
 
-        time.sleep(0.1)
+        time.sleep(0.02)
 
     return False
 
-def click_button_by_image(image_path, retries=8, offset_y=0):
-    """Ищет кнопку на экране по цветному шаблону и кликает в её центр (с возможностью смещения по Y)."""
+def is_yandex_yellow(rgb):
+    """Проверяет, что пиксель имеет фирменный желтый цвет кнопки Яндекс Музыки (#FED42B)."""
+    r, g, b = rgb[:3]
+    return r > 200 and g > 170 and b < 110 and (r - b) > 110
+
+def locate_yellow_button(image_path, search_region):
+    """Находит кнопку по шаблону и отсеивает ложные срабатывания на обложке по цвету."""
+    try:
+        matches = list(pyautogui.locateAllOnScreen(
+            image_path,
+            region=search_region,
+            confidence=0.88,
+            grayscale=False
+        ))
+    except TypeError:
+        matches = list(pyautogui.locateAllOnScreen(image_path, region=search_region))
+    except pyautogui.ImageNotFoundException:
+        matches = []
+
+    if not matches:
+        return None
+
+    # Сортируем снизу вверх (кнопка всегда ниже обложки)
+    matches.sort(key=lambda b: b.top, reverse=True)
+
+    for box in matches:
+        cx, cy = pyautogui.center(box)
+        # Проверяем пиксели вокруг центра (на случай если в самом центре черная буква "С" или треугольник)
+        for dx, dy in ((0, 0), (-15, 0), (15, 0), (0, -8), (0, 8)):
+            try:
+                if is_yandex_yellow(pyautogui.pixel(int(cx + dx), int(cy + dy))):
+                    return (int(cx), int(cy))
+            except Exception:
+                continue
+
+    # Если проверка пикселя не сработала, берем самый нижний результат
+    best = matches[0]
+    c = pyautogui.center(best)
+    return (int(c.x), int(c.y))
+
+def click_button_by_image(image_path, region=None, retries=12):
+    """
+    Ждет появления кнопки 'Слушать' и убеждается, что страница перестала съезжать вниз
+    из-за подгрузки обложки, прежде чем кликнуть.
+    """
     if not os.path.exists(image_path):
         return False
 
-    pyautogui.moveTo(5, 5)
+    # Уводим курсор с пути, чтобы всплывающая подсказка от прошлой карточки не закрыла кнопку
+    pyautogui.moveTo(50, 50)
+
+    search_region = region
+    if region and region[3] > 350:
+        # Отрезаем верхние 180 пикселей (шапка) и нижние 90 пикселей (нижний плеер)
+        top_cut = 180
+        bottom_cut = 90
+        search_region = (
+            region[0],
+            region[1] + top_cut,
+            region[2],
+            max(100, region[3] - top_cut - bottom_cut)
+        )
+
+    last_pos = None
 
     for _ in range(retries):
-        try:
-            location = pyautogui.locateCenterOnScreen(image_path, confidence=0.85, grayscale=False)
-        except TypeError:
-            location = pyautogui.locateCenterOnScreen(image_path)
-        except pyautogui.ImageNotFoundException:
-            location = None
+        pos = locate_yellow_button(image_path, search_region)
 
-        if location:
-            pyautogui.click(location.x, location.y + offset_y)
-            return True
+        if pos:
+            # Если мы нашли кнопку, проверяем через 40 мс — не съехала ли она ниже из-за загрузки обложки
+            if last_pos and abs(pos[1] - last_pos[1]) <= 5:
+                pyautogui.click(pos[0], pos[1])
+                return True
+            
+            last_pos = pos
+            time.sleep(0.045)
+        else:
+            time.sleep(0.03)
 
-        time.sleep(0.1)
+    # Если цикл закончился, но кнопку мы видели в последнем кадре — кликаем по ней
+    if last_pos:
+        pyautogui.click(last_pos[0], last_pos[1])
+        return True
 
     return False
 
 def main():
     playlist_name = ask_playlist_name()
     
-    # Если нажали Esc или "Отмена" — ничего не делаем
     if playlist_name is None:
         return
 
-    # Запускаем или разворачиваем Яндекс Музыку
-    if not ensure_yandex_music_running():
+    orig_x, orig_y = pyautogui.position()
+
+    win_id = ensure_yandex_music_running()
+    if not win_id:
         return
 
-    # Если строка была пустой (например, нажали Backspace -> Enter), 
-    # то после запуска/активации окна просто выходим
     if playlist_name == "":
         return
 
-    if not find_and_click_text(playlist_name, retries=4, double_click=False):
-        return
+    try:
+        region = get_window_region(win_id)
 
-    # Даем странице плейлиста время на открытие и ищем кнопку
-    time.sleep(0.1)
-    click_button_by_image(LISTEN_BTN_IMAGE, retries=8, offset_y=0)
+        if not find_and_click_text(playlist_name, region=region, retries=3, double_click=False):
+            return
+
+        # Короткая пауза на начало переключения страницы и поиск со стабилизацией
+        time.sleep(0.06)
+        click_button_by_image(LISTEN_BTN_IMAGE, region=region, retries=12)
+    finally:
+        # Возвращаем мышь туда, где она была до запуска
+        pyautogui.moveTo(orig_x, orig_y)
 
 if __name__ == "__main__":
     main()
